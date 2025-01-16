@@ -6,77 +6,137 @@ on:
     branches:
       - v4.x
 jobs:
+  test:
+    runs-on: ubuntu-24.04
+    concurrency:
+      group: test-${{ github.ref }}-${{ github.event_name }}
+      cancel-in-progress: true
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test docker image
+        run: |
+          make build
+          make test-ci-setup
+          make test-ci
+        env:
+          DOCKER_IMAGE: ghcr.io/${{ github.repository }}:test
+
+      - name: Store test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts
+          path: |
+            tests/output/*.log
+            tests/data
+            !tests/data/*.drawio
+            !tests/data/*/*.drawio
+            
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     concurrency:
       group: build-${{ github.ref }}-${{ github.event_name }}
       cancel-in-progress: true
+    permissions:
+      packages: write
+    outputs:
+      tags: ${{ steps.meta.outputs.tags }}
     steps:
       # Setup
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
-      - uses: rlespinasse/github-slug-action@v5
-      - name: Build docker image
-        run: make build
-        shell: bash
-        env:
-          DOCKER_IMAGE: ${{ github.repository }}:${{ env.GITHUB_REF_SLUG }}
-      - name: Setup CI for test
-        run: make test-ci-setup
-        shell: bash
-      - name: Test docker image
-        run: make test-ci
-        shell: bash
-        env:
-          DOCKER_IMAGE: ${{ github.repository }}:${{ env.GITHUB_REF_SLUG }}
-      - name: Test docker image // Store output logs
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-docker-image-logs
-          path: "tests/output/*.log"
-        if: ${{ always() }}
-      - name: Test docker image // Store output files
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-docker-image-files
-          path: |
-            tests/data
-            !tests/data/*.drawio
-            !tests/data/*/*.drawio
-        if: ${{ always() }}
 
-  build-multiarch:
-    runs-on: ubuntu-latest
-    concurrency:
-      group: build-multiarch-${{ github.ref }}-${{ github.event_name }}
-      cancel-in-progress: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rlespinasse/github-slug-action@v5
-      - name: Set up QEMU
+      - name: setup QEMU
         uses: docker/setup-qemu-action@v3
         with:
-          platforms: "arm64,arm"
+          platforms: 'linux/amd64,linux/arm64'
+    
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Build docker image
-        run: make build-multiarch
-        shell: bash
-        env:
-          DOCKER_IMAGE: ${{ github.repository }}:${{ env.GITHUB_REF_SLUG }}
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_TOKEN }}
+  
+      - name: Generate Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ env.DRAWIO_VERSION }}-{{sha}}
+            type=ref,event=branch
+            type=ref,event=pr
+    
+      - name: Build and push multi-platform
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            DRAWIO_VERSION=${{ env.DRAWIO_VERSION }}
+            BUILD_DATE=${{ steps.meta.outputs.created }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   release:
     runs-on: ubuntu-latest
-    needs:
-      - build
-      - build-multiarch
-    concurrency:
-      group: release-${{ github.ref }}-${{ github.event_name }}
+    needs: [test, build]
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'push' && github.ref == 'refs/heads/v4.x'
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v4
-      - name: Release this docker image
-        uses: rlespinasse/release-that@v1
+  
+      - name: Semantic Release
+        uses: cycjimmy/semantic-release-action@v4
         with:
-          github-token: ${{ secrets.GH_TOKEN }}
+          extra_plugins: |
+            @semantic-release/git
+            @semantic-release/changelog
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+
+      - name: Generate Release metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          flavor: |
+            latest=false
+          tags: |
+            type=semver,pattern=v{{version}},value=v${{ env.DRAWIO_VERSION }}
+            type=semver,pattern=v{{major}}.{{minor}},value=v${{ env.DRAWIO_VERSION }}
+            type=semver,pattern=v{{major}},value=v${{ env.DRAWIO_VERSION }}
+            type=raw,value=latest
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GH_TOKEN }}
+
+      - name: Tag and Push Release Images
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+          BUILD_TAGS: ${{ needs.build.outputs.tags }}
+        run: |
+          for tag in $(echo "${{ steps.meta.outputs.tags }}" | tr '\n' ' '); do
+            echo "Pushing: $tag"
+            docker pull $(echo "$BUILD_TAGS" | tr '\n' ' ' | cut -d' ' -f1)
+            docker tag $(echo "$BUILD_TAGS" | tr '\n' ' ' | cut -d' ' -f1) $tag
+            docker push $tag
+          done
